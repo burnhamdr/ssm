@@ -71,6 +71,68 @@ def batch_mahalanobis(L, x):
     xs = np.einsum('...i,...ij->...j', x, L_inv)
     return np.sum(xs**2, axis=-1)
 
+def multivariate_laplace_logpdf(data, mus, b, Sigmas, Ls=None):
+    """
+    Compute the log probability density of a multivariate Laplace distribution.
+
+    Parameters
+    ----------
+    data : array_like (..., D)
+        The points at which to evaluate the log density
+
+    mus : array_like (..., D)
+        The mean(s) of the Laplace distribution(s)
+
+    b : float
+        The scale parameter of the Laplace distribution
+
+    Sigmas : array_like (..., D, D)
+        The covariances(s) of the Laplace distribution(s)
+
+    Ls : array_like (..., D, D)
+        Optionally pass in the Cholesky decomposition of Sigmas
+
+    Returns
+    -------
+    lps : array_like (...,)
+        Log probabilities under the multivariate Laplace distribution(s).
+    """
+    D = data.shape[-1]
+    assert mus.shape[-1] == D
+    assert Sigmas.shape[-2] == Sigmas.shape[-1] == D
+    if Ls is not None:
+        assert Ls.shape[-2] == Ls.shape[-1] == D
+    else:
+        Ls = np.linalg.cholesky(Sigmas)
+
+    mahal_dist = np.sqrt(batch_mahalanobis(Ls, data - mus))
+    log_det = 2 * np.sum(np.log(np.diagonal(Ls, axis1=-2, axis2=-1)), axis=-1)
+    
+    log_pdf = -D * np.log(2 * b) - 0.5 * log_det - mahal_dist / b
+
+    return log_pdf
+
+def univariate_laplace_logpdf(x, mu=0, b=1):
+    """
+    Compute the log probability density of a univariate Laplace distribution.
+
+    Parameters
+    ----------
+    x : array_like
+        The points at which to evaluate the log density
+    mu : float
+        The location parameter of the Laplace distribution
+    b : float
+        The scale parameter of the Laplace distribution
+
+    Returns
+    -------
+    logpdf : array_like
+        Log probabilities under the univariate Laplace distribution
+    """
+    logpdf = -np.log(2 * b) - np.abs(x - mu) / b
+    return logpdf
+
 def _multivariate_normal_logpdf(data, mus, Sigmas, Ls=None):
     """
     Compute the log probability density of a multivariate Gaussian distribution.

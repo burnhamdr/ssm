@@ -1,11 +1,15 @@
 import copy
 import warnings
 
+import scipy
+
 import autograd.numpy as np
 import autograd.numpy.random as npr
 
 from autograd.scipy.special import gammaln, digamma, logsumexp
 from autograd.scipy.special import logsumexp
+from autograd.numpy.numpy_boxes import ArrayBox
+
 
 from ssm.util import random_rotation, ensure_args_are_lists, \
     logistic, logit, one_hot
@@ -720,7 +724,7 @@ class InputDrivenObservations(Observations):
 
 class InputDrivenGaussianObservations(Observations):
 
-    def __init__(self, K, D, M=0, w_prior_mean = 0, w_prior_sigma=1000,  mu_prior_mean = 0, mu_prior_sigma=1000):
+    def __init__(self, K, D, M=0, prior_mean = 0, prior_sigma=1000, penalty = None, laplace_b = 1.0):
         """
         @param K: number of states
         @param D: dimensionality of output
@@ -732,10 +736,10 @@ class InputDrivenGaussianObservations(Observations):
         self.M = M
         self.D = D
         self.K = K
-        self.w_prior_mean = w_prior_mean
-        self.w_prior_sigma = w_prior_sigma
-        self.mu_prior_mean = mu_prior_mean
-        self.mu_prior_sigma = mu_prior_sigma
+        self.prior_mean = prior_mean
+        self.prior_sigma = prior_sigma
+        self.penalty = penalty
+        self.laplace_b = laplace_b
 
         self.mus = npr.randn(K, D)
         self._sqrt_Sigmas = npr.randn(K, D, D)
@@ -785,19 +789,26 @@ class InputDrivenGaussianObservations(Observations):
         self.mus = self.mus[perm]
         self._sqrt_Sigmas = self._sqrt_Sigmas[perm]
         
-#     def log_prior(self):
-#         lp = 0
-#         for k in range(self.K):#for each state
-# #             for c in range(self.C - 1):
-# #                 weights = self.Wk[k][c]
-#             for c in range(self.D):#for each observation dimension
-#                 weights = self.Wks[k][c]#will be a vector of size M
-#                 mus = self.mus[k][c]#will be a scalar
-#                 #add a log prior on the weights..
-#                 lp += stats.multivariate_normal_logpdf(weights,mus=np.repeat(self.w_prior_mean, (self.M)),Sigmas=((self.w_prior_sigma) ** 2) * np.identity(self.M))
-#                 #add a log prior on the mus..
-#                 lp += stats.multivariate_normal_logpdf(np.array([mus]), mus=np.repeat(self.mu_prior_mean, (1)),Sigmas=((self.mu_prior_sigma) ** 2) * np.identity(1))
-#         return lp
+    def log_prior(self):
+        lp = 0
+        for k in range(self.K):#for each state
+            for c in range(self.D):#for each observation dimension
+                weights = self.Wks[k][c]#will be a vector of size M
+                #add a log prior on the weights..
+                #L2#
+                if self.penalty == 'L2':
+                    lp += stats.multivariate_normal_logpdf(weights,mus=np.repeat(self.prior_mean, (self.M)),Sigmas=((self.prior_sigma) ** 2) * np.identity(self.M))
+                #L1#
+                elif self.penalty == 'L1':
+                    # lp += stats.multivariate_laplace_logpdf(weights, mus=np.repeat(self.prior_mean, (self.M)), b=self.laplace_b, Sigmas=((self.prior_sigma) ** 2) * np.identity(self.M))
+                    for i in range(self.M):
+                        lp += stats.univariate_laplace_logpdf(weights[i], mu=self.prior_mean, b=self.prior_sigma)
+                    #     if isinstance(weights[i], ArrayBox):
+                    #         w_ = weights[i]._value
+                    #     else:
+                    #         w_ = weights[i]
+                        # lp += scipy.stats.laplace.logpdf(w_, loc=self.prior_mean, scale=self.prior_sigma)
+        return lp
 
     # Calculate time dependent log prob - output is matrix of size TxKxD
     # Input is size TxM

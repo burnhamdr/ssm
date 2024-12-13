@@ -19,6 +19,7 @@ class _Hierarchical(object):
     """
     def __init__(self, base_class, *args, tags=(None,), lmbda=0.01, **kwargs):
         # Variance of child params around parent params
+        self.lmbda_prior_mu = lmbda
         self.lmbda = lmbda
 
         # Top-level parameters (parent)
@@ -42,7 +43,7 @@ class _Hierarchical(object):
             else:#if lmbda is a scalar
                 lmbdas[i] = self.lmbda#np.full_like(arr, self.lmbda)
         
-        return np.array(lmbdas)
+        return np.sqrt(np.array(lmbdas))
 
     def stack_child_params(self):
         #collect the parameter arrays as stacked arrays for each parameter type in temp
@@ -63,15 +64,23 @@ class _Hierarchical(object):
         temp = self.stack_child_params()
         temp_lmbdas = [0]*len(self.parent.params)
         btwn_state_stds = [0]*len(self.parent.params)
+        lambda_lower_bound = 1E-3#hiearchical prior lambda params cannot be negative
+        lambda_upper_bound = 10.
         for j, spvecs in enumerate(temp):#for each parameter vector in the child params set
             #impute the lambda for each parameter as the standard deviation across all child params
             temp_lmbdas[j] = np.std(spvecs, axis=-1)
             #average across each parameter vector and then take the standard deviation
             btwn_state_stds[j] = np.std(np.mean(spvecs, axis=-1))
+            # #ensure that the standard deviation is larger than the lower bound..
+            if btwn_state_stds[j] < lambda_lower_bound:
+                btwn_state_stds[j] = lambda_lower_bound + lambda_lower_bound/2
+            elif btwn_state_stds[j] > lambda_upper_bound:#truncate at
+                btwn_state_stds[j] = lambda_upper_bound
+
         
         #clip temp_lmbdas to be larger than 1E-6
         # temp_lmbdas = [np.mean(np.clip(lmbda, 1E-6, np.inf)) for lmbda in temp_lmbdas]
-        temp_lmbdas = [np.clip(np.mean(lmbda), 7.5E-2, btwn_state_stds[j]) for j, lmbda in enumerate(temp_lmbdas)]
+        temp_lmbdas = [np.clip(np.mean(lmbda), lambda_lower_bound, btwn_state_stds[j]) for j, lmbda in enumerate(temp_lmbdas)]
 
         # weights = np.exp(np.linspace(-1., 0., self.window_size))
         # weights /= weights.sum()
@@ -106,7 +115,7 @@ class _Hierarchical(object):
 
     @property
     def lambdas(self):
-        return self._sqrt_lmbdas#**2
+        return self._sqrt_lmbdas**2
 
     @params.setter
     def params(self, value):
@@ -123,8 +132,6 @@ class _Hierarchical(object):
         self.parent.permute(perm)
         for tag in self.tags:
             self.children[tag].permute(perm)
-        if self.lambda_update == 'optimized':
-            self._sqrt_lmbdas.permute(perm)
 
     @ensure_args_are_lists
     def initialize(self, datas, inputs=None, masks=None, tags=None, init_method="random"):
@@ -144,11 +151,22 @@ class _Hierarchical(object):
 
 
     def log_prior(self):
-        lmbdas = self.lambdas
         lp = self.parent.log_prior()
+        # if self.lambda_update == 'optimized':
+            #add gaussian prior on the lambda params with strength sqrt(gamma)
+            # lp += np.sum(norm.logpdf(self._sqrt_lmbdas, 0.025, np.sqrt(self.gamma)))
+        # lambda_lower_bound = 5E-3#hiearchical prior lambda params cannot be negative
+        # # # Clip the absolute values of lambdas to be larger than 1E-6
+        # lmbdas = np.clip(self.lambdas, lambda_lower_bound, np.inf)
+        # self._sqrt_lmbdas = np.sqrt(lmbdas)
+        # Gaussian prior on sqrt lambdas
+        # for cplmbda, lpmu in zip(self._sqrt_lmbdas, self.lmbda_prior_mu):
+        #     lp += np.sum(norm.logpdf(cplmbda, 0.0, 0.1))
+
+        # lmbdas = self.lambdas
         # Gaussian likelihood on each child param given parent param
         for tag in self.tags:
-            for pprm, cprm, cplmbda in zip(self.parent.params, self.children[tag].params, lmbdas):
+            for pprm, cprm, cplmbda in zip(self.parent.params, self.children[tag].params, self._sqrt_lmbdas):
                 lp += np.sum(norm.logpdf(cprm, pprm, cplmbda))
         return lp
 
@@ -202,9 +220,10 @@ class HierarchicalTransitions(_Hierarchical):
 
 
 class HierarchicalObservations(_Hierarchical):
-    def __init__(self, base_class, K, D, M, *args, tags=(None,), lmbda=0.01, gamma=0.8, lambda_update = 'recursive', **kwargs):
+    def __init__(self, base_class, K, D, M, *args, tags=(None,), lmbda=0.01, gamma=0.0, lambda_update = 'fixed', **kwargs):
         # Variance of child params around parent params
         self.lmbda = lmbda
+        self.lmbda_prior_mu = lmbda
         self.window_size = 5
         self.gamma = gamma
         self.lambda_update = lambda_update
@@ -271,11 +290,11 @@ class HierarchicalObservations(_Hierarchical):
         T = sum([data.shape[0] for data in datas])
         def _objective(params, itr):
             self.params = params
-            if self.lambda_update == 'optimized':
-                prior_param_pen = np.linalg.norm(np.array(self.params[-1]), ord=2)**2
-            else:
-                prior_param_pen = 0.
-            obj = _expected_log_joint(expectations) - self.gamma*prior_param_pen
+            # if self.lambda_update == 'optimized':
+            #     prior_param_pen = np.linalg.norm(np.array(self.params[-1]), ord=2)**2
+            # else:
+            #     prior_param_pen = 0.
+            obj = _expected_log_joint(expectations)# - self.gamma*prior_param_pen
             return -obj / T
 
         # self.params = \
@@ -284,7 +303,8 @@ class HierarchicalObservations(_Hierarchical):
         # self.params = \
         #     adamc(grad(_objective), self.params, num_iters=num_iters, **kwargs)
 
-        lambda_lower_bound = 0.075#hiearchical prior lambda params cannot be negative
+        lambda_lower_bound = 1E-6#hiearchical prior lambda params cannot be negative
+        lambda_upper_bound = 1E-2
         # var_lower_bound = 1E-6#variance params cannot be negative
         #make bounds so that the None is returned for all params except the lambda params, the last entry in the params tuple
         low_bounds = []
@@ -311,20 +331,22 @@ class HierarchicalObservations(_Hierarchical):
                 up_bounds.append(ub_tup)
 
             if self.lambda_update == 'optimized':
-                #collect the parameter arrays as stacked arrays for each parameter type in temp
-                temp = self.stack_child_params()
-                #iterate over each parameter vector and calculate the standard deviation between the states 
-                # of the average parameter vectors across all child distributions.
-                btwn_state_stds = [0]*len(self.parent.params)
-                for j, spvecs in enumerate(temp):#for each parameter vector in the child params set
-                    #average across each parameter vector and then take the standard deviation
-                    btwn_state_stds[j] = np.std(np.mean(spvecs, axis=-1))
-                    # #ensure that the standard deviation is larger than the lower bound..
-                    if btwn_state_stds[j] < lambda_lower_bound:
-                        btwn_state_stds[j] = lambda_lower_bound + 1E-4
+                # #collect the parameter arrays as stacked arrays for each parameter type in temp
+                # temp = self.stack_child_params()
+                # #iterate over each parameter vector and calculate the standard deviation between the states 
+                # # of the average parameter vectors across all child distributions.
+                # btwn_state_stds = [0]*len(self.parent.params)
+                # for j, spvecs in enumerate(temp):#for each parameter vector in the child params set
+                #     #average across each parameter vector and then take the standard deviation
+                #     btwn_state_stds[j] = np.std(np.mean(spvecs, axis=-1))
+                #     # #ensure that the standard deviation is larger than the lower bound..
+                #     if btwn_state_stds[j] < lambda_lower_bound:
+                #         btwn_state_stds[j] = lambda_lower_bound + lambda_lower_bound/2
+                #     elif btwn_state_stds[j] > lambda_upper_bound:#truncate at 
+                #         btwn_state_stds[j] = lambda_upper_bound
                 #the last param is always the lambda params, one value for each observation model parameter
                 low_bounds.append(tuple([np.full_like(self.params[-1][j], lambda_lower_bound) for j in range(len(self.params[-1]))]))#add the bounds for the lambda params
-                up_bounds.append(tuple([np.full_like(self.params[-1][j], btwn_state_stds[j]) for j in range(len(self.params[-1]))]))#add the bounds for the lambda params, btwn_state_stds[j]
+                up_bounds.append(tuple([np.full_like(self.params[-1][j], lambda_upper_bound) for j in range(len(self.params[-1]))]))#add the bounds for the lambda params, btwn_state_stds[j]
             #package into a single bounds tuple
             bounds = tuple(zip(low_bounds, up_bounds))
             #construct var_lower_bound array in the same shape as the variance params array
