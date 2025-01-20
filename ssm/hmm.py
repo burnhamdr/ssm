@@ -102,7 +102,8 @@ class HMM(object):
             robust_autoregressive=obs.RobustAutoRegressiveObservations,
             diagonal_robust_ar=obs.RobustAutoRegressiveDiagonalNoiseObservations,
             diagonal_robust_autoregressive=obs.RobustAutoRegressiveDiagonalNoiseObservations,
-            input_driven_obs_gaussian=obs.InputDrivenGaussianObservations
+            input_driven_obs_gaussian=obs.InputDrivenGaussianObservations,
+            mixed_input_driven_gaussian = obs.MixedInputDrivenGaussianObservations,
             )
 
         if isinstance(observations, str):
@@ -119,13 +120,27 @@ class HMM(object):
                 else observation_classes[observations](K, D, M=M, **observation_kwargs)
 
         if hierarchical_observation_tags is not None:
-            if not isinstance(observations.parent, obs.Observations):
-                raise TypeError("'parent observations' must be a subclass of"
-                                " ssm.observations.Observations")
-            for tag in hierarchical_observation_tags:
-                if not isinstance(observations.children[tag], obs.Observations):
-                    raise TypeError("'child observations' must be a subclass of"
+            #allow for hierarchical to be a dictionary of tags each dictionary key denoting
+            #a particular parent distribution and the child label tags
+            if not isinstance(hierarchical_observation_tags, dict):
+                assert isinstance(hierarchical_observation_tags, list)
+                if not isinstance(observations.parent, obs.Observations):
+                    raise TypeError("'parent observations' must be a subclass of"
                                     " ssm.observations.Observations")
+                for tag in hierarchical_observation_tags:
+                    if not isinstance(observations.children[tag], obs.Observations):
+                        raise TypeError("'child observations' must be a subclass of"
+                                        " ssm.observations.Observations")
+            elif isinstance(hierarchical_observation_tags, dict):
+                #check that 
+                for parent_tag, child_tags in hierarchical_observation_tags.items():
+                    if not isinstance(observations.parent, obs.Observations):
+                        raise TypeError("'parent observations' must be a subclass of"
+                                        " ssm.observations.Observations")
+                    for tag in child_tags:
+                        if not isinstance(observations.children[tag], obs.Observations):
+                            raise TypeError("'child observations' must be a subclass of"
+                                            " ssm.observations.Observations")
         else:
             if not isinstance(observations, obs.Observations):
                 raise TypeError("'observations' must be a subclass of"
@@ -314,7 +329,7 @@ class HMM(object):
             pi0 = self.init_state_distn.initial_state_distn
             Ps = self.transitions.transition_matrices(data, input, mask, tag)
             log_likes = self.observations.log_likelihoods(data, input, mask, tag)
-            ll += hmm_normalizer(pi0, Ps, log_likes)
+            ll += hmm_normalizer(pi0, Ps, log_likes) 
             assert np.isfinite(ll)
         return ll
 
