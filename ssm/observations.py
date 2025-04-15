@@ -1038,8 +1038,41 @@ class MixedInputDrivenGaussianObservations(Observations):
             sample = np.array([mus_vcomps[z[t]] + time_dependent_input[t,z[t],:] + np.dot(sqrt_Sigmas[z[t]], npr.randn(D)) for t in range(T)])                               
         return sample    
     
-    def m_step(self, expectations, datas, inputs, masks, tags, optimizer = "bfgs", **kwargs):
+    def m_step(self, expectations, datas, inputs, masks, tags, optimizer='bfgs', **kwargs):
         Observations.m_step(self, expectations, datas, inputs, masks, tags, optimizer, **kwargs)
+
+        # K, D, M = self.K, self.D, self.M
+        # # Initialize accumulators for means, weights, and variances
+        # J = np.zeros((K, D))  # Responsibilities for each state (K) and dimension (D)
+        # h = np.zeros((K, D))  # Weighted residuals for means
+        # sqerr = np.zeros((K, D, D))  # Weighted squared residuals for variances
+        # grad_Wk = np.zeros((K, D, M))  # Gradient for Wks (weights)
+
+        # # Loop through datasets, inputs, and expectations
+        # for (Ez, _, _), y, u in zip(expectations, datas, inputs):
+        #     # Calculate time-dependent input (size TxKxD)
+        #     time_dependent_input = self.calculate_input(u)
+            
+        #     # Compute residuals (y - mean - input effect)
+        #     resid = y[:, None, :] - self.mus - time_dependent_input  # TxKxD
+            
+        #     # Update responsibilities (J)
+        #     J += np.sum(Ez[:, :, None], axis=0)  # Aggregate responsibilities per state and dimension
+            
+        #     # Update residuals for means (h)
+        #     h += np.sum(Ez[:, :, None] * resid, axis=0)  # Weighted residuals for means
+            
+        #     # Update variances (sqerr)
+        #     sqerr += np.sum(Ez[:, :, None, None] * resid[:, :, :, None] * resid[:, :, None, :], axis=0)
+            
+        #     # Update input weights (grad_Wk)
+        #     grad_Wk += np.sum(Ez[:, :, None, None] * resid[:, :, :, None] * u[:, None, None, :], axis=0)
+
+        # # Final parameter updates
+        # self.mus = h / J  # Update means
+        # self.Wks += learning_rate * grad_Wk / J[:, :, None]  # Update input weights (add regularization if needed)
+        # self._sqrt_Sigmas = np.linalg.cholesky(sqerr / J[:, None, None] + 1e-8 * np.eye(self.D))  # Update variances
+
 
     def smooth(self, expectations, data, input, tag):
         """

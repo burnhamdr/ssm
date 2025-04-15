@@ -4,14 +4,26 @@ import warnings
 import autograd.numpy as np
 import autograd.numpy.random as npr
 from autograd.scipy.stats import norm
-from autograd.misc.optimizers import sgd, adam
-from ssm.optimizers import adamc, lbfgs, bfgs, rmsprop
+from ssm.optimizers import adam, bfgs, rmsprop, sgd, lbfgs
 from autograd import grad
 from autograd.numpy.numpy_boxes import ArrayBox, SequenceBox
 
 from ssm.util import ensure_args_are_lists
-
+import psutil
 from itertools import combinations, product
+import os
+p = psutil.Process(os.getpid())
+
+# Set CPU affinity for the main process
+cpu_list = list(np.arange(84))
+p.cpu_affinity(cpu_list)
+
+# Set CPU affinity for all threads of the current process
+for child in p.children(recursive=True):
+    try:
+        child.cpu_affinity(cpu_list)
+    except psutil.AccessDenied:
+        print(f"Could not set affinity for process {child.pid}")
 
 def lists_to_tuples(obj):
     if isinstance(obj, list):
@@ -304,9 +316,9 @@ class _Hierarchical(object):
     Base class for hierarchical models.  Maintains a parent class and a
     bunch of children with their own perturbed parameters.
     """
-    def __init__(self, base_class, *args, tags=(None,), lmbda=0.01, frozen=(None,), hierarchical_params=(None,),**kwargs):
+    def __init__(self, base_class, *args, tags=(None,), lmbda=0.01, gamma=0.1, frozen=(None,), hierarchical_params=(None,),**kwargs):
         # Variance of child params around parent params
-        self.lmbda_prior_mu = lmbda
+        self.lmbda_prior_mu = gamma
         self.lmbda = lmbda
         self.lmda_memory = []
         assert isinstance(self.lmbda, (float, int, list, tuple, np.ndarray)), "lmbda must be a float, list, tuple, or ndarray"
@@ -586,8 +598,8 @@ class _Hierarchical(object):
         return stacked_params
 
     def update_lmbdas(self):
-        lambda_lower_bound = 1E-3#hiearchical prior lambda params cannot be negative
-        lambda_upper_bound = 10.
+        # lambda_lower_bound = 1E-3#hiearchical prior lambda params cannot be negative
+        # lambda_upper_bound = 10.
 
         temp = self.stack_child_params()
         temp_lmbdas = [0]*self.num_lambdas
@@ -677,16 +689,28 @@ class _Hierarchical(object):
                 #first one.
                 all_child_tags = [tag for tag in self.tags if tag[i] == uval]
                 ref_tag = all_child_tags[0]
+                #skip the first entry which is the parent
+                j = self.tags.index(ref_tag) + 1
                 for ip, pinds in tag_param_inds.items():
+                    # if self.frozen != (None,):
+                        # isfree = np.sum(self.free_mask[j][ip][pinds]) == len(self.free_mask[j][ip][pinds].flatten())
+                        # if isfree:
                     extracted_params[i][uval].append(self.children[ref_tag].params[ip][pinds])#copy.deepcopy(self.children[ref_tag].params[ip][pinds])
-                    # test_labels.append((i,uval,ref_tag))
+                    
+            #     #if extracted_params[i] is empty, then remove it
+            #     if not extracted_params[i][uval]:
+            #         del extracted_params[i][uval]
+            # #if the unique value is not in the dictionary, remove the key
+            # if not extracted_params[i]:
+            #     del extracted_params[i]
+        
         if self.lambda_update == 'optimized':
             extracted_params['lmbdas'] = [self._sqrt_lmbdas]#copy.deepcopy(self._sqrt_lmbdas)
             # test_labels.append('lmbdas')
                 
         return extracted_params
     
-    def deflate_params(self):
+    def deflate_params(self, mode='fe'):
         #extract params from all parent and child distributions
         prms = self.params
 
@@ -705,8 +729,55 @@ class _Hierarchical(object):
             prms_dict = self.extract_shared_params()
             #unpack the dictionary into a list of parameter arrays
             self.prms_keys, prms = get_dict_leaf_items(prms_dict)
+            
+            #handle frozen hierarchical parameters by keeping them
+            #in the shared parameter output, but removing them
+            #from the optimization of the model.
+            frozen_inds = []
+            for ipkey, pkey in enumerate(self.prms_keys):
+                i = pkey[0]
+                if mode == 'fe':
+                    #get only the parent parameter indices and lmbdas
+                    if pkey[0] in ['parent', 'lmbdas']:
+                        continue
+                    else:
+                        frozen_inds.append(ipkey)
+                        continue
+                elif mode == 're':
+                    #get only the unfrozen child parameters
+                    if pkey[0] in ['parent', 'lmbdas']:
+                        frozen_inds.append(ipkey)
+                        continue
+                    else:#take care of the frozen params within the child params
+                        uval = pkey[1]
+                        #get all parent parameter indices for this tag tuple entry
+                        #this will be a dictionary with keys corresponding to the
+                        #parent parameter indices and values that are tuples of
+                        #parameter array indices.
+                        tag_param_inds = self.hierarchical_params[i]
+                        #for each referenced parent parameter tuple entry
+                        #grab a child model parameter value. All the
+                        #child model parameter values for this tag tuple entry
+                        #and unique value will be the same, so just grab the
+                        #first one.
+                        all_child_tags = [tag for tag in self.tags if tag[i] == uval]
+                        ref_tag = all_child_tags[0]
+                        #skip the first entry which is the parent
+                        j = self.tags.index(ref_tag) + 1
+                        for ip, pinds in tag_param_inds.items():
+                            if self.frozen != (None,):
+                                isfree = np.sum(self.free_mask[j][ip][pinds]) == len(self.free_mask[j][ip][pinds].flatten())
+                                if not isfree:
+                                    frozen_inds.append(ipkey)
+            
+            #delete the frozen params from the optimization
+            for index in sorted(frozen_inds, reverse=True):
+                del prms[index]
+                del self.prms_keys[index]
+                
             #turn prms into tuples of tuples
             prms = lists_to_tuples(prms)
+        
         #if frozen is specified then we must handle freezing the 
         #parent and child distribution parameter values. Only
         #extracting the free parameter values.
@@ -739,7 +810,7 @@ class _Hierarchical(object):
             for tag, prms in zip(self.tags, value[1:]):
                 self.children[tag].params = prms
     
-    def inflate_params(self, params):
+    def inflate_params(self, params, mode='fe'):
         #get copy of the full parameter set
         # base_params = self.params
         #cast tuples to lists for mutability as we
@@ -759,47 +830,49 @@ class _Hierarchical(object):
             #get the key for where the deflated param
             #refers to in the original parameter array
             pkey = self.prms_keys[i]
-            if pkey[0] == 'parent':#if this is a parent parameter
-                mask = self.free_mask[0]#handle frozen parent parameters
-                # output = base_params[0]#get the full parent params
-                #overwrite the full parent params with the values
-                #from the deflated parameter while respecting
-                #the frozen parameters.
-                #first find if any masks sum to 0, this means an empty
-                #parameter array would have been extracted, and subsequently
-                #omitted during the deflation process. If this is the case
-                #then insert an array of zeros in the shape of the mask in val.
-                temp_val = []
-                iv = 0
-                for m in mask:#get the next val entry
-                    if np.sum(m) == 0:
-                        #then we know the parameter array at this index
-                        #in vals was omitted. Don't increment the val array
-                        #index. input empty array
-                        val_entry = np.zeros(0)
-                    else:
-                        val_entry = val[iv]#otherwise get the next val_entry
-                        iv += 1#increment the val_entry index
-                    temp_val.append(val_entry)#store out the parameter
-                val = lists_to_tuples(temp_val)
-                for ip, mask in enumerate(mask):
-                    # base_params[0][ip][mask][:] = val[ip]
-                    if isinstance(val[ip], ArrayBox):
-                        self.parent.params[ip][mask] = val[ip]._value
-                    else:
-                        self.parent.params[ip][mask] = val[ip]
+            if mode == 'fe':
+                if pkey[0] == 'parent':#if this is a parent parameter
+                    mask = self.free_mask[0]#handle frozen parent parameters
+                    # output = base_params[0]#get the full parent params
+                    #overwrite the full parent params with the values
+                    #from the deflated parameter while respecting
+                    #the frozen parameters.
+                    #first find if any masks sum to 0, this means an empty
+                    #parameter array would have been extracted, and subsequently
+                    #omitted during the deflation process. If this is the case
+                    #then insert an array of zeros in the shape of the mask in val.
+                    temp_val = []
+                    iv = 0
+                    for m in mask:#get the next val entry
+                        if np.sum(m) == 0:
+                            #then we know the parameter array at this index
+                            #in vals was omitted. Don't increment the val array
+                            #index. input empty array
+                            val_entry = np.zeros(0)
+                        else:
+                            val_entry = val[iv]#otherwise get the next val_entry
+                            iv += 1#increment the val_entry index
+                        temp_val.append(val_entry)#store out the parameter
                     
-                # base_params[0] = reverse_apply_masks(mask, output, val)
-            elif pkey[0] == 'lmbdas':
-                #lambdas are not set up to be hierarchical or frozen
-                #so just set the lambdas in the inflated parameter arrays
-                #as the values of the deflated parameter
-                # base_params[-1] = val
-                if isinstance(val, ArrayBox):
-                    self._sqrt_lmbdas = val._value[0]
-                else:
-                    self._sqrt_lmbdas = val[0]
-            else:
+                    val = lists_to_tuples(temp_val)
+                    for ip, mask in enumerate(mask):
+                        # base_params[0][ip][mask][:] = val[ip]
+                        if isinstance(val[ip], ArrayBox):
+                            self.parent.params[ip][mask] = val[ip]._value
+                        else:
+                            self.parent.params[ip][mask] = val[ip]
+                        
+                    # base_params[0] = reverse_apply_masks(mask, output, val)
+                elif pkey[0] == 'lmbdas':
+                    #lambdas are not set up to be hierarchical or frozen
+                    #so just set the lambdas in the inflated parameter arrays
+                    #as the values of the deflated parameter
+                    # base_params[-1] = val
+                    if isinstance(val, ArrayBox):
+                        self._sqrt_lmbdas = val._value[0]
+                    else:
+                        self._sqrt_lmbdas = val[0]
+            elif mode == 're':
                 #if not parent or lmbdas, then it is a child parameter
                 #and the pkey should be decomposed into (tag_tuple_entry, unique_value)
                 #to update the child parameter values find all tags that have the same
@@ -824,12 +897,23 @@ class _Hierarchical(object):
                     #so we can unpack it in order as well.
                     for ic, (ip, pinds) in enumerate(hier_param_inds.items()):
                         # base_params[k][ip][pinds][:] = np.array(val[ic])
-                        
-                        #use to update the child parameter values directly
-                        if isinstance(val[ic], ArrayBox):
-                            self.children[tag].params[ip][pinds] = val[ic]._value
+                        if self.frozen != (None,):
+                            isfree = np.sum(self.free_mask[k][ip][pinds]) == len(self.free_mask[k][ip][pinds].flatten())
+                            if isfree:
+                                #use to update the child parameter values directly
+                                if isinstance(val[ic], ArrayBox):
+                                    self.children[tag].params[ip][pinds] = val[ic]._value
+                                else:
+                                    self.children[tag].params[ip][pinds] = val[ic]
+                            # else:
+                                #set equal to the parent parameter value
+                                # self.children[tag].params[ip][pinds] = self.parent.params[ip][pinds]
                         else:
-                            self.children[tag].params[ip][pinds] = val[ic]
+                            #use to update the child parameter values directly
+                            if isinstance(val[ic], ArrayBox):
+                                self.children[tag].params[ip][pinds] = val[ic]._value
+                            else:
+                                self.children[tag].params[ip][pinds] = val[ic]
                     
                     #if there are some parameters in the observaiton models which
                     #are NOT hierarchically linked to the parent distribution parameters
@@ -839,7 +923,6 @@ class _Hierarchical(object):
                     if self.not_hierarchical_mask != (None,):
                         for ip, pmask in self.not_hierarchical_mask.items():
                             # base_params[k][ip][pmask] = base_params[0][ip][pmask]#copy.deepcopy(base_params[0][ip][pmask])
-                            
                             #use to update the child parameter values directly
                             self.children[tag].params[ip][pmask] = self.parent.params[ip][pmask]
         # #convert the lists back to tuples
@@ -918,6 +1001,7 @@ class _Hierarchical(object):
             #equal to the parent parameters. This will ensure that only
             #the parameters that are hierarchically linked to the parent
             #are drawn from distributions around the parent parameters.
+            # init_spread = 0.1
             for tag in self.tags:
                 self.children[tag].params = copy.deepcopy(self.parent.params)#
             
@@ -963,9 +1047,10 @@ class _Hierarchical(object):
         # # # Clip the absolute values of lambdas to be larger than 1E-6
         # lmbdas = np.clip(self.lambdas, lambda_lower_bound, np.inf)
         # self._sqrt_lmbdas = np.sqrt(lmbdas)
-        # Gaussian prior on sqrt lambdas
+        
+        # # Gaussian prior on sqrt lambdas
         # for cplmbda, lpmu in zip(self._sqrt_lmbdas, self.lmbda_prior_mu):
-        #     lp += np.sum(norm.logpdf(cplmbda, 0.0, 0.1))
+        #     lp += np.sum(norm.logpdf(cplmbda, 0.0, lpmu))
 
         # lmbdas = self.lambdas
         if self.hierarchical_params == (None,):
@@ -984,18 +1069,45 @@ class _Hierarchical(object):
                 ppind = ht_key[1]#get the parent parameter list index
                 #get the parent parameter values that are hierarchically linked
                 prm = self.parent.params[ppind][ht_vals]
+                lambda_val = self._sqrt_lmbdas[i]
 
                 #use the ex_params second layer keys which delineate
                 #the unique values of the tag tuple entry
                 #draw child parameters for each unique value for this tag ind
                 for uval_key in ex_params[tag_ind].keys():
-                    for tag in self.tags:#iterate over ALL tag labels 
+                    #draw child parameters around the parent parameters
+                    #new approach marginalizing over the hierarchical parameters
+                    #draw child parameters around the parent parameters
+                    # cprm = prm + lambda_val * npr.randn(*prm.shape)
+                    tag_lp = 0
+                    tag_count = 0
+                    for j, tag in enumerate(self.tags):#iterate over ALL tag labels
                         #find where the tag tuple entry matches the unique value
                         if tag[tag_ind] == uval_key:
-                            #draw child parameters around the parent parameters
+                            # if self.frozen != (None,):
+                            #     isfree = np.sum(self.free_mask[j][ppind][ht_vals]) == len(self.free_mask[j][ppind][ht_vals].flatten())
+                            #     if not isfree:
+                            #         #parameters are tuples and cannot be modified in place.
+                            #         #make a copy of the child parameters and update this
+                            #         #mutable list copy.
+                            #         new_child_tuple = list(self.children[tag].params)#copy.deepcopy(self.children[tag].params)
+                            #         #update the child parameter values at the appropriate
+                            #         #parent param tuple index and parameter array indices
+                            #         #from hierarchical_params
+                            #         if isinstance(cprm, ArrayBox):
+                            #             new_child_tuple[ppind][ht_vals] = cprm._value
+                            #         else:
+                            #             new_child_tuple[ppind][ht_vals] = cprm
+                            #         #update the model's child parameter values
+                            #         self.children[tag].params = tuple(new_child_tuple)
+                            # else:
                             cprm = self.children[tag].params[ppind][ht_vals]
-                            lp += np.sum(norm.logpdf(cprm, prm, self._sqrt_lmbdas[i]))
-            
+                            tag_count += 1
+                            tag_lp += np.sum(norm.logpdf(cprm, prm, lambda_val))
+                            # lp += np.sum(norm.logpdf(cprm, prm, lambda_val))
+                    # lp += tag_lp/tag_count
+                    # lp += tag_lp/len(ex_params[tag_ind].keys())
+                    lp += tag_lp
         return lp
 
     def m_step(self, expectations, datas, inputs, masks, tags, optimizer="adam", num_iters=25, **kwargs):
@@ -1061,7 +1173,6 @@ class HierarchicalObservations(_Hierarchical):
         self.K = K
         self.D = D
 #         self.C = C
-
 
                 # Variance of child params around parent params
         self.lmbda_prior_mu = lmbda
@@ -1243,13 +1354,13 @@ class HierarchicalObservations(_Hierarchical):
                 assert max(self.frozen) < len(base_params), "free index out of range of self.params. see getter method for self.params"
                 for f in self.frozen:
                     self.free_mask[f] = np.zeros_like(base_params[f]).astype(bool)
-                #check that none of the frozen parameters are hierarchical parameters
-                #this will only happen if parent paremeters are frozen, i.e.
-                #0 is in the frozen list
-                if 0 in self.frozen:
-                    for tag_key in self.hierarchical_params:
-                        if 0 in self.hierarchical_params[tag_key].keys():
-                            raise ValueError("Hierarchical parameters cannot be frozen")
+                # #check that none of the frozen parameters are hierarchical parameters
+                # #this will only happen if parent paremeters are frozen, i.e.
+                # #0 is in the frozen list
+                # if 0 in self.frozen:
+                #     for tag_key in self.hierarchical_params:
+                #         if 0 in self.hierarchical_params[tag_key].keys():
+                #             raise ValueError("Hierarchical parameters cannot be frozen")
             else:#if frozen is a dictionary
                 assert dict_depth(self.frozen) <= 2, "frozen dictionary must have depth <= 2, first level hierarchical param tuple, second level specific child model param tuples."
                 assert all(isinstance(f, int) for f in self.frozen.keys()), "frozen keys must be integers specifying indices in the base params tuple, see params property"
@@ -1316,6 +1427,47 @@ class HierarchicalObservations(_Hierarchical):
         
         # self.set_lmdas()
         # self.initialize()
+    def redraw_children_params(self):
+        #first extract the shared parameters
+        ex_params = self.extract_shared_params()
+        #need to iterate over the unpacked dictionary of hierarchical parameters
+        #because the list index translates to the index of the lambda values.
+        hier_tag_keys, hier_tag_vals = get_dict_leaf_items(self.hierarchical_params)
+        for i, (ht_key, ht_vals) in enumerate(zip(hier_tag_keys, hier_tag_vals)):
+            tag_ind = ht_key[0]#get the tag tuple entry index
+            ppind = ht_key[1]#get the parent parameter list index
+            #get the parent parameter values that are hierarchically linked
+            prm = self.parent.params[ppind][ht_vals]
+            lambda_val = self._sqrt_lmbdas[i]
+
+            #use the ex_params second layer keys which delineate
+            #the unique values of the tag tuple entry
+            #draw child parameters for each unique value for this tag ind
+            for uval_key in ex_params[tag_ind].keys():
+                #draw child parameters around the parent parameters
+                #new approach marginalizing over the hierarchical parameters
+                #draw child parameters around the parent parameters
+                cprm = prm + lambda_val * npr.randn(*prm.shape)
+                for j, tag in enumerate(self.tags):#iterate over ALL tag labels
+                    #find where the tag tuple entry matches the unique value
+                    if tag[tag_ind] == uval_key:
+                        if self.frozen != (None,):
+                            isfree = np.sum(self.free_mask[j][ppind][ht_vals]) == len(self.free_mask[j][ppind][ht_vals].flatten())
+                            if not isfree:
+                                #parameters are tuples and cannot be modified in place.
+                                #make a copy of the child parameters and update this
+                                #mutable list copy.
+                                new_child_tuple = list(self.children[tag].params)#copy.deepcopy(self.children[tag].params)
+                                #update the child parameter values at the appropriate
+                                #parent param tuple index and parameter array indices
+                                #from hierarchical_params
+                                if isinstance(cprm, ArrayBox):
+                                    new_child_tuple[ppind][ht_vals] = cprm._value
+                                else:
+                                    new_child_tuple[ppind][ht_vals] = cprm
+                                #update the model's child parameter values
+                                self.children[tag].params = tuple(new_child_tuple)
+        
 
     def log_likelihoods(self, data, input, mask, tag):
         return self.children[tag].log_likelihoods(data, input, mask, tag)
@@ -1332,7 +1484,7 @@ class HierarchicalObservations(_Hierarchical):
                 raise Exception("Invalid tag: ".format(tag))
 
         # expected log joint
-        def _expected_log_joint(expectations):
+        def _expected_log_joint_fe(expectations):
             if (self.lambda_update in ['recursive', 'optimized']):
                 self.lmda_memory.append(self._sqrt_lmbdas)
             if self.lambda_update == 'recursive':
@@ -1355,10 +1507,28 @@ class HierarchicalObservations(_Hierarchical):
                     elbo += np.sum(expected_states * lls)
 
             return elbo
+        
+        # expected log joint
+        def _expected_log_joint_re(expectations):
+            if (self.lambda_update in ['recursive', 'optimized']):
+                self.lmda_memory.append(self._sqrt_lmbdas)
+            if self.lambda_update == 'recursive':
+                self.update_lmbdas()
+
+            # elbo = self.log_prior()
+            elbo = 0.
+            for data, input, mask, tag, (expected_states, expected_joints, _) \
+                in zip(datas, inputs, masks, tags, expectations):
+
+                if hasattr(self.children[tag], 'log_likelihoods'):
+                    lls = self.children[tag].log_likelihoods(data, input, mask, tag)
+                    elbo += np.sum(expected_states * lls)
+
+            return elbo
 
         # define optimization target
         T = sum([data.shape[0] for data in datas])
-        def _objective(params_, itr):
+        def _objective_re(params_, itr):
             #set the parameters of the model to the passed param values
             #prior to calculating the expected log joint
             if self.hierarchical_params == (None,):
@@ -1367,13 +1537,33 @@ class HierarchicalObservations(_Hierarchical):
                 #params will be deflated, i.e. only the hierarchical and free params
                 #need to inflate the params to the full parameter set to set
                 #the model parameters
-                self.inflate_params(params_)
+                self.inflate_params(params_, mode='re') #inflate the deflated params to the full parameter set
+                # self.redraw_children_params()
                 
             # if self.lambda_update == 'optimized':
             #     prior_param_pen = np.linalg.norm(np.array(self.params[-1]), ord=2)**2
             # else:
             #     prior_param_pen = 0.
-            obj = _expected_log_joint(expectations)# - self.gamma*prior_param_pen
+            obj = _expected_log_joint_re(expectations)# - self.gamma*prior_param_pen
+            return -obj / T
+        
+        def _objective_fe(params_, itr):
+            #set the parameters of the model to the passed param values
+            #prior to calculating the expected log joint
+            if self.hierarchical_params == (None,):
+                self.params = params_
+            else:
+                #params will be deflated, i.e. only the hierarchical and free params
+                #need to inflate the params to the full parameter set to set
+                #the model parameters
+                self.inflate_params(params_, mode='fe') #inflate the deflated params to the full parameter set
+                # self.redraw_children_params()
+                
+            # if self.lambda_update == 'optimized':
+            #     prior_param_pen = np.linalg.norm(np.array(self.params[-1]), ord=2)**2
+            # else:
+            #     prior_param_pen = 0.
+            obj = _expected_log_joint_fe(expectations)# - self.gamma*prior_param_pen
             return -obj / T
 
         # self.params = \
@@ -1447,18 +1637,22 @@ class HierarchicalObservations(_Hierarchical):
         # optimizer = dict(adam=adam, sgd=sgd)[optimizer]# bfgs=bfgs, lbfgs=lbfgs, rmsprop=rmsprop,
         optimizer = dict(adam=adam, bfgs=bfgs, lbfgs=lbfgs, rmsprop=rmsprop, sgd=sgd)[optimizer]
 
-
         if self.hierarchical_params == (None,):
             self.params = \
                 optimizer(_objective, self.params, num_iters=num_iters, **kwargs)
         else:
             #deflate the parameters to only the free and hierarchical params
-            prms = self.deflate_params()
+            prms = self.deflate_params(mode='re')
+            prms = optimizer(_objective_re, prms, num_iters=num_iters, **kwargs)
+            self.inflate_params(prms, mode='re')
+            
+            prms = self.deflate_params(mode='fe')
             # prms = optimizer(grad(_objective), prms, num_iters=num_iters, **kwargs)
-            prms = optimizer(_objective, prms, num_iters=num_iters, **kwargs)
+            prms = optimizer(_objective_fe, prms, num_iters=num_iters, **kwargs)
             #inflate the new parameters to the full parameter set
             #call params setter method now
-            self.inflate_params(prms)
+            self.inflate_params(prms, mode='fe')
+            # self.redraw_children_params()
 
 
 class HierarchicalEmissions(_Hierarchical):

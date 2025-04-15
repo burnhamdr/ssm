@@ -411,7 +411,7 @@ class HMM(object):
             epoch = itr // M
             m = itr % M
             i = perm[epoch][m]
-            return datas[i], inputs[i], masks[i], tags[i][i]
+            return datas[i], inputs[i], masks[i], tags[i]
 
         # Define the objective (negative ELBO)
         def _objective(params, itr):
@@ -470,6 +470,11 @@ class HMM(object):
         lls  = [self.log_probability(datas, inputs, masks, tags)]
 
         pbar = ssm_pbar(num_iters, verbose, "LP: {:.1f}", [lls[-1]])
+        
+        if 'patience' in kwargs:
+            patience = kwargs['patience']
+        else:
+            patience = 1
 
         for itr in pbar:
             # E step: compute expected latent states with current parameters
@@ -484,15 +489,28 @@ class HMM(object):
 
             # Store progress
             lls.append(self.log_prior() + sum([ll for (_, _, ll) in expectations]))
-
+            
             if verbose == 2:
               pbar.set_description("LP: {:.1f}".format(lls[-1]))
 
             # Check for convergence
+            # if itr > 0 and abs(lls[-1] - lls[-2]) < tolerance:
+            #     if verbose == 2:
+            #       pbar.set_description("Converged to LP: {:.1f}".format(lls[-1]))
+            #     break
             if itr > 0 and abs(lls[-1] - lls[-2]) < tolerance:
-                if verbose == 2:
-                  pbar.set_description("Converged to LP: {:.1f}".format(lls[-1]))
-                break
+                patience_counter += 1  # Increment patience counter
+                if patience_counter >= patience:  # Check if patience limit is reached
+                    if verbose == 2:
+                        pbar.set_description("Converged to LP: {:.1f}".format(lls[-1]))
+                    break
+            else:
+                patience_counter = 0  # Reset patience counter if condition not met
+            
+            # Check for nan values
+            if np.isnan(lls[-1]):
+              pbar.set_description("Diverged to nan")
+              break
 
         return lls
 
@@ -501,6 +519,7 @@ class HMM(object):
             verbose=2, method="em",
             initialize=True,
             init_method="random",
+            patience=1,
             **kwargs):
 
         _fitting_methods = \
@@ -533,6 +552,7 @@ class HMM(object):
                                         masks=masks,
                                         tags=tags,
                                         verbose=verbose,
+                                        patience=patience,
                                         **kwargs)
 
 
